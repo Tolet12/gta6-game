@@ -1,79 +1,48 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Screenshot staging for ?shot=<scene>. Each scene poses a real gameplay
+// state (positions, wanted level, mission phase, money) and lets the normal
+// simulation run, so the captured frame is the actual game, never a mock-up.
+// Scenes are deterministic for a given seed: cover, chase, mission, complete.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+export function stageShot(game, name) {
+  const hud = game.hud;
+  game.startGame(true); // fresh state, title screen off, simulation live
+  if (name === 'cover') {
+    game.money = 320;
+    game.missions.startNext(); // M1 active: objective + checkpoints on the HUD
+    game.placePlayerInCar(game.starterCar, -52, -85, Math.PI / 2, 15);
+    game.input.setKey('KeyW', true);
+    hud.showBanner('M1 · FIRST RUN', 'Hit every checkpoint across town', 30);
+  } else if (name === 'chase') {
+    game.money = 410;
+    // East along the beach road: open sand on one side, so the frame stays
+    // readable even when the units start shoving.
+    game.placePlayerInCar(game.starterCar, -120, 255, Math.PI / 2, 16);
+    game.wanted.setStars(4);
+    game.police.forceSpawnNear(game.player.car.pos, 3);
+    // Two units right on the player's tail at matched speed, so they sit
+    // between the chase camera (~12 behind) and the player car in frame.
+    const [u0, u1] = game.police.units;
+    if (u0) { u0.pos.set(-126, 0, 253.4); u0.heading = Math.PI / 2; u0.speed = 15.5; }
+    if (u1) { u1.pos.set(-129.5, 0, 256.6); u1.heading = Math.PI / 2; u1.speed = 15.5; }
+    game.input.setKey('KeyW', true);
+  } else if (name === 'mission') {
+    game.money = 120;
+    game.player.pos.set(7, 0, 187);
+    game.player.heading = 2.48; // facing the beacon at the start marker
+    game.camYaw = -0.62; // camera south-west of the player, looking north-east
+    // Locals and traffic around the beacon for a lived-in frame.
+    game.peds.slice(0, 4).forEach((ped, i) => {
+      ped.pos.set(11 + i * 3.5, 0, 176 - i * 4);
+      ped.pickTarget();
+    });
+    const car = game.trafficDrivers[0]?.car;
+    if (car) { car.pos.set(-14, 0, 170); car.heading = Math.PI / 2; }
+  } else if (name === 'complete') {
+    game.money = 450;
+    game.missions.nextIndex = 2; game.missions.doneCount = 2;
+    game.missions.phase = 'offered'; game.missions.refreshBeacon();
+    game.placePlayerInCar(game.starterCar, -85, -38, 0, 12);
+    game.input.setKey('KeyW', true);
+    hud.showBanner('MISSION COMPLETE', '+$300 — Hot Package delivered', 30);
   }
-  return Infinity;
-}
-
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
-}
-
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
-  }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
 }
